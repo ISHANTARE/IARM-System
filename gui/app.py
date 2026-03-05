@@ -229,6 +229,12 @@ class IARMSApp(tk.Tk):
                    ).pack(side='left', padx=5)
         ttk.Button(tb, text="📥 Purchase", style='Action.TButton',
                    command=self._purchase_dlg).pack(side='left', padx=5)
+        ttk.Button(tb, text="🔧 Adjust Stock", style='Action.TButton',
+                   command=self._stock_adjust_dlg).pack(side='left', padx=5)
+        ttk.Button(tb, text="📤 Export CSV", style='Action.TButton',
+                   command=lambda: self._export_inv_csv(export_products_csv)).pack(side='left', padx=5)
+        ttk.Button(tb, text="📂 Import CSV", style='Action.TButton',
+                   command=lambda: self._import_inv_csv(import_products_csv)).pack(side='left', padx=5)
 
         ttk.Label(tb, text="Search:").pack(side='left', padx=(20,5))
         sv = tk.StringVar()
@@ -249,6 +255,9 @@ class IARMSApp(tk.Tk):
         tree.pack(side='left', fill='both', expand=True)
         sbar.pack(side='right', fill='y')
 
+        # double-click to edit
+        tree.bind('<Double-1>', lambda e: self._edit_product_dlg(tree))
+
         def pop(*a):
             tree.delete(*tree.get_children())
             t = sv.get().strip()
@@ -267,8 +276,12 @@ class IARMSApp(tk.Tk):
         sv.trace_add('write', pop)
         pop()
 
+        ttk.Label(self.content, text="💡 Double-click a product to edit it",
+                  foreground='#7f8c8d', font=('Segoe UI', 9)).pack(anchor='w', pady=(5,0))
+
     def _add_product_dlg(self):
         from modules.inventory import add_product, get_all_categories
+        from utils.helpers import validate_positive_number
         d = tk.Toplevel(self); d.title("Add Product"); d.geometry("450x560")
         d.transient(self); d.grab_set()
         f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
@@ -297,6 +310,12 @@ class IARMSApp(tk.Tk):
             code, name = fields['product_code'].get().strip(), fields['product_name'].get().strip()
             if not code or not name:
                 messagebox.showerror("Error", "Code and name required."); return
+            # validate numeric fields
+            for fld, label in [('purchase_price','Buy Price'),('selling_price','Sell Price'),
+                               ('gst_rate','GST%'),('current_stock','Stock'),('reorder_level','Reorder level')]:
+                ok, _, err = validate_positive_number(fields[fld].get() or '0', label)
+                if not ok:
+                    messagebox.showerror("Validation", err); return
             try:
                 cid = next((c['category_id'] for c in cats if c['category_name'] == cv.get()), None)
                 add_product(code, name, cid, fields['unit'].get(),
@@ -312,6 +331,138 @@ class IARMSApp(tk.Tk):
 
         ttk.Button(f, text="💾 Save", style='Action.TButton', command=save).grid(
             row=r+1, column=0, columnspan=2, pady=20, sticky='ew')
+
+    def _edit_product_dlg(self, tree):
+        """Edit an existing product (double-click handler)."""
+        sel = tree.selection()
+        if not sel: return
+        pid = int(sel[0])
+        from modules.inventory import get_product, update_product, get_all_categories
+        from utils.helpers import validate_positive_number
+        prod = get_product(pid)
+        if not prod: return
+
+        d = tk.Toplevel(self); d.title(f"Edit: {prod['product_name']}"); d.geometry("450x480")
+        d.transient(self); d.grab_set()
+        f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
+        ttk.Label(f, text=f"Edit Product [{prod['product_code']}]",
+                  style='Header.TLabel').grid(row=0, column=0, columnspan=2, pady=(0,15), sticky='w')
+
+        fields = {}
+        for i, (k, l, v) in enumerate([
+            ('product_name','Name*:', prod['product_name']),
+            ('unit','Unit:', prod['unit']),
+            ('purchase_price','Buy Price:', str(prod['purchase_price'])),
+            ('selling_price','Sell Price:', str(prod['selling_price'])),
+            ('gst_rate','GST%:', str(prod['gst_rate'])),
+            ('reorder_level','Reorder Level:', str(prod['reorder_level'])),
+        ], start=1):
+            ttk.Label(f, text=l).grid(row=i, column=0, sticky='w', pady=5)
+            var = tk.StringVar(value=v)
+            ttk.Entry(f, textvariable=var, width=25).grid(row=i, column=1, sticky='w', pady=5, padx=(10,0))
+            fields[k] = var
+
+        cats = get_all_categories()
+        r = len(fields) + 1
+        ttk.Label(f, text="Category:").grid(row=r, column=0, sticky='w', pady=5)
+        cur_cat = prod.get('category_name', '')
+        cv = tk.StringVar(value=cur_cat)
+        ttk.Combobox(f, textvariable=cv, values=[c['category_name'] for c in cats],
+                     state='readonly', width=22).grid(row=r, column=1, sticky='w', pady=5, padx=(10,0))
+
+        def save():
+            name = fields['product_name'].get().strip()
+            if not name:
+                messagebox.showerror("Error", "Name is required."); return
+            for fld, label in [('purchase_price','Buy Price'),('selling_price','Sell Price'),
+                               ('gst_rate','GST%'),('reorder_level','Reorder Level')]:
+                ok, _, err = validate_positive_number(fields[fld].get() or '0', label)
+                if not ok:
+                    messagebox.showerror("Validation", err); return
+            try:
+                cid = next((c['category_id'] for c in cats if c['category_name'] == cv.get()), None)
+                update_product(pid, self.current_user['user_id'],
+                    product_name=name, unit=fields['unit'].get(),
+                    purchase_price=float(fields['purchase_price'].get() or 0),
+                    selling_price=float(fields['selling_price'].get() or 0),
+                    gst_rate=float(fields['gst_rate'].get() or 18),
+                    reorder_level=float(fields['reorder_level'].get() or 10),
+                    category_id=cid)
+                messagebox.showinfo("✅", "Product updated!"); d.destroy(); self.show_inventory()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(f, text="💾 Update", style='Action.TButton', command=save).grid(
+            row=r+1, column=0, columnspan=2, pady=20, sticky='ew')
+
+    def _stock_adjust_dlg(self):
+        """Dialog for stock adjustments (damaged, miscounted, etc)."""
+        from modules.inventory import get_all_products, record_stock_transaction
+        d = tk.Toplevel(self); d.title("Stock Adjustment"); d.geometry("480x350")
+        d.transient(self); d.grab_set()
+        f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
+        ttk.Label(f, text="Stock Adjustment", style='Header.TLabel').grid(
+            row=0, column=0, columnspan=2, pady=(0,15), sticky='w')
+
+        prods = get_all_products()
+        pm = {f"{p['product_code']} - {p['product_name']} (stock: {p['current_stock']})": p['product_id'] for p in prods}
+
+        ttk.Label(f, text="Product:").grid(row=1, column=0, sticky='w', pady=5)
+        pv = tk.StringVar()
+        ttk.Combobox(f, textvariable=pv, values=list(pm.keys()), state='readonly', width=35).grid(
+            row=1, column=1, sticky='w', padx=10, pady=5)
+
+        ttk.Label(f, text="Direction:").grid(row=2, column=0, sticky='w', pady=5)
+        dir_v = tk.StringVar(value='adjustment_in')
+        ttk.Combobox(f, textvariable=dir_v, values=['adjustment_in', 'adjustment_out'],
+                     state='readonly', width=18).grid(row=2, column=1, sticky='w', padx=10, pady=5)
+
+        qv, rv = tk.StringVar(value='0'), tk.StringVar()
+        ttk.Label(f, text="Quantity:").grid(row=3, column=0, sticky='w', pady=5)
+        ttk.Entry(f, textvariable=qv, width=15).grid(row=3, column=1, sticky='w', padx=10, pady=5)
+        ttk.Label(f, text="Reason:").grid(row=4, column=0, sticky='w', pady=5)
+        ttk.Entry(f, textvariable=rv, width=30).grid(row=4, column=1, sticky='w', padx=10, pady=5)
+
+        def save():
+            pid = pm.get(pv.get())
+            if not pid: messagebox.showerror("Error", "Select a product."); return
+            try:
+                q = float(qv.get())
+                if q <= 0: raise ValueError("Quantity must be positive")
+                record_stock_transaction(pid, dir_v.get(), q, 0,
+                    '', rv.get() or 'Manual adjustment', self.current_user['user_id'])
+                messagebox.showinfo("✅", "Stock adjusted!"); d.destroy(); self.show_inventory()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(f, text="💾 Save", style='Action.TButton', command=save).grid(
+            row=5, column=0, columnspan=2, pady=20, sticky='ew')
+
+    def _export_inv_csv(self, export_fn):
+        """Export products to CSV."""
+        import os
+        path = filedialog.asksaveasfilename(defaultextension='.csv',
+            filetypes=[('CSV files', '*.csv')], title='Export Products')
+        if path:
+            try:
+                export_fn(path)
+                messagebox.showinfo("✅", f"Exported to {os.path.basename(path)}")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def _import_inv_csv(self, import_fn):
+        """Import products from CSV."""
+        path = filedialog.askopenfilename(filetypes=[('CSV files', '*.csv')], title='Import Products')
+        if path:
+            try:
+                ok, errs, details = import_fn(path, self.current_user['user_id'])
+                msg = f"Imported {ok} products successfully."
+                if errs:
+                    msg += f"\n{errs} errors:\n" + "\n".join(details[:5])
+                messagebox.showinfo("Import Results", msg)
+                self.show_inventory()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
 
     def _purchase_dlg(self):
         from modules.inventory import get_all_products, record_stock_transaction
@@ -370,6 +521,9 @@ class IARMSApp(tk.Tk):
             tree.heading(c, text=h); tree.column(c, width=w)
         tree.pack(fill='both', expand=True)
 
+        # double-click to edit
+        tree.bind('<Double-1>', lambda e: self._edit_cust_dlg(tree))
+
         def pop(*a):
             tree.delete(*tree.get_children())
             t = sv.get().strip()
@@ -382,8 +536,12 @@ class IARMSApp(tk.Tk):
                     f"{c['discount_rate']}%", format_currency(o)))
         sv.trace_add('write', pop); pop()
 
+        ttk.Label(self.content, text="💡 Double-click a customer to edit",
+                  foreground='#7f8c8d', font=('Segoe UI', 9)).pack(anchor='w', pady=(5,0))
+
     def _add_cust_dlg(self):
         from modules.invoice import add_customer
+        from utils.helpers import validate_phone, validate_email, validate_gst
         d = tk.Toplevel(self); d.title("Add Customer"); d.geometry("450x500")
         d.transient(self); d.grab_set()
         f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
@@ -411,6 +569,13 @@ class IARMSApp(tk.Tk):
         def save():
             name = fields['customer_name'].get().strip()
             if not name: messagebox.showerror("Error", "Name required."); return
+            # validate phone, email, GST
+            ok, _ = validate_phone(fields['phone'].get())
+            if not ok: messagebox.showerror("Validation", "Phone number looks invalid (use digits, 7-15 chars)."); return
+            if not validate_email(fields['email'].get()):
+                messagebox.showerror("Validation", "Email format looks wrong."); return
+            if not validate_gst(fields['gst_number'].get()):
+                messagebox.showerror("Validation", "GST number must be 15 chars (e.g. 22AAAAA0000A1Z5)."); return
             try:
                 add_customer(name, tv.get(), fields['phone'].get(), fields['email'].get(),
                     fields['address'].get(), fields['gst_number'].get(),
@@ -422,6 +587,67 @@ class IARMSApp(tk.Tk):
                 messagebox.showerror("Error", str(e))
 
         ttk.Button(f, text="💾 Save", style='Action.TButton', command=save).grid(
+            row=r+1, column=0, columnspan=2, pady=20, sticky='ew')
+
+    def _edit_cust_dlg(self, tree):
+        """Edit an existing customer (double-click handler)."""
+        sel = tree.selection()
+        if not sel: return
+        cid = int(sel[0])
+        from modules.invoice import get_customer, update_customer
+        from utils.helpers import validate_phone, validate_email, validate_gst
+        cust = get_customer(cid)
+        if not cust: return
+
+        d = tk.Toplevel(self); d.title(f"Edit: {cust['customer_name']}"); d.geometry("450x520")
+        d.transient(self); d.grab_set()
+        f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
+        ttk.Label(f, text=f"Edit Customer", style='Header.TLabel').grid(
+            row=0, column=0, columnspan=2, pady=(0,15), sticky='w')
+
+        fields = {}
+        for i, (k, l, v) in enumerate([
+            ('customer_name','Name*:', cust['customer_name']),
+            ('phone','Phone:', cust.get('phone','')),
+            ('email','Email:', cust.get('email','')),
+            ('address','Address:', cust.get('address','')),
+            ('gst_number','GST:', cust.get('gst_number','')),
+            ('credit_limit','Credit Limit:', str(cust['credit_limit'])),
+            ('discount_rate','Discount%:', str(cust['discount_rate'])),
+            ('payment_terms_days','Terms (days):', str(cust.get('payment_terms_days', 30))),
+        ], start=1):
+            ttk.Label(f, text=l).grid(row=i, column=0, sticky='w', pady=5)
+            var = tk.StringVar(value=v)
+            ttk.Entry(f, textvariable=var, width=25).grid(row=i, column=1, sticky='w', pady=5, padx=(10,0))
+            fields[k] = var
+
+        r = len(fields) + 1
+        ttk.Label(f, text="Type:").grid(row=r, column=0, sticky='w')
+        tv = tk.StringVar(value=cust['customer_type'])
+        ttk.Combobox(f, textvariable=tv, values=['retail','wholesale'],
+                     state='readonly', width=22).grid(row=r, column=1, sticky='w', padx=(10,0))
+
+        def save():
+            name = fields['customer_name'].get().strip()
+            if not name: messagebox.showerror("Error", "Name required."); return
+            ok, _ = validate_phone(fields['phone'].get())
+            if not ok: messagebox.showerror("Validation", "Phone number looks invalid."); return
+            if not validate_email(fields['email'].get()):
+                messagebox.showerror("Validation", "Email format looks wrong."); return
+            if not validate_gst(fields['gst_number'].get()):
+                messagebox.showerror("Validation", "GST number must be 15 chars."); return
+            try:
+                update_customer(cid, customer_name=name, customer_type=tv.get(),
+                    phone=fields['phone'].get(), email=fields['email'].get(),
+                    address=fields['address'].get(), gst_number=fields['gst_number'].get(),
+                    credit_limit=float(fields['credit_limit'].get() or 0),
+                    discount_rate=float(fields['discount_rate'].get() or 0),
+                    payment_terms_days=int(fields['payment_terms_days'].get() or 30))
+                messagebox.showinfo("✅", "Customer updated!"); d.destroy(); self.show_customers()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(f, text="💾 Update", style='Action.TButton', command=save).grid(
             row=r+1, column=0, columnspan=2, pady=20, sticky='ew')
 
     # -- Invoice management (with dispatch/pay/cancel buttons) --
@@ -1342,7 +1568,10 @@ class IARMSApp(tk.Tk):
                           ("🏆 Top Debtors", self._debtors_report),
                           ("📦 ABC", self._abc_report),
                           ("⚠️ Low Stock", self._stock_report),
-                          ("📅 Monthly", self._monthly_report)]:
+                          ("📅 Monthly", self._monthly_report),
+                          ("💰 Profit", self._profit_report),
+                          ("📉 Sales Chart", self._monthly_chart),
+                          ("🥧 ABC Chart", self._abc_pie_chart)]:
             ttk.Button(rf, text=text, style='Action.TButton', command=cmd).pack(side='left', padx=4)
         self.rpt = ttk.Frame(self.content); self.rpt.pack(fill='both', expand=True, pady=10)
         self._aged_report()
@@ -1428,6 +1657,120 @@ class IARMSApp(tk.Tk):
                 format_currency(d['outstanding'])))
         tree.pack(fill='both', expand=True)
 
+    def _profit_report(self):
+        """Per-product profit breakdown."""
+        self._cr()
+        from modules.reporting import get_profit_report
+        data = get_profit_report()
+        if not data:
+            ttk.Label(self.rpt, text="No sales data yet.",
+                      font=('Segoe UI',12), foreground='#7f8c8d').pack(pady=30)
+            return
+        cols = ('code','name','qty','revenue','cost','profit')
+        tree = ttk.Treeview(self.rpt, columns=cols, show='headings', height=15)
+        for c, h, w in [('code','Code',80),('name','Product',200),('qty','Qty Sold',80),
+                         ('revenue','Revenue',130),('cost','Cost',130),('profit','Profit',130)]:
+            tree.heading(c, text=h); tree.column(c, width=w)
+        for d in data:
+            profit = d.get('total_profit', 0) or 0
+            tag = 'profit' if profit > 0 else ('loss' if profit < 0 else '')
+            tree.insert('','end', values=(
+                d['product_code'], d['product_name'],
+                d.get('total_qty_sold', 0) or 0,
+                format_currency(d.get('total_revenue', 0) or 0),
+                format_currency(d.get('total_cost', 0) or 0),
+                format_currency(profit)), tags=(tag,))
+        tree.tag_configure('profit', foreground='#27ae60')
+        tree.tag_configure('loss', foreground='#e74c3c')
+        tree.pack(fill='both', expand=True)
+
+        # summary row
+        total_profit = sum((d.get('total_profit',0) or 0) for d in data)
+        sf = ttk.Frame(self.rpt); sf.pack(fill='x', pady=10)
+        color = '#27ae60' if total_profit >= 0 else '#e74c3c'
+        ttk.Label(sf, text=f"Total Profit: {format_currency(total_profit)}",
+                  font=('Segoe UI', 14, 'bold'), foreground=color).pack(side='right', padx=20)
+
+    def _monthly_chart(self):
+        """Bar chart of monthly revenue using matplotlib."""
+        self._cr()
+        from modules.reporting import get_monthly_sales_trend
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ttk.Label(self.rpt, text="matplotlib not installed. Run: pip install matplotlib",
+                      foreground='#e74c3c').pack(pady=30)
+            return
+
+        data = get_monthly_sales_trend(12)
+        if not data:
+            ttk.Label(self.rpt, text="No sales data to chart.",
+                      font=('Segoe UI',12), foreground='#7f8c8d').pack(pady=30)
+            return
+
+        months = [d['month'] for d in data]
+        revenue = [d['revenue'] for d in data]
+        collected = [d['collected'] for d in data]
+
+        fig = Figure(figsize=(10, 4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        x = range(len(months))
+        w = 0.35
+        ax.bar([i - w/2 for i in x], revenue, w, label='Revenue', color='#3498db')
+        ax.bar([i + w/2 for i in x], collected, w, label='Collected', color='#27ae60')
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(months, rotation=45, ha='right', fontsize=8)
+        ax.set_ylabel('Amount (₹)')
+        ax.set_title('Monthly Sales vs Collections')
+        ax.legend()
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.rpt)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    def _abc_pie_chart(self):
+        """Pie chart of ABC classification."""
+        self._cr()
+        from modules.inventory import get_abc_summary
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ttk.Label(self.rpt, text="matplotlib not installed. Run: pip install matplotlib",
+                      foreground='#e74c3c').pack(pady=30)
+            return
+
+        data = get_abc_summary()
+        if not data:
+            ttk.Label(self.rpt, text="No product data. Run ABC Recalc first.",
+                      font=('Segoe UI',12), foreground='#7f8c8d').pack(pady=30)
+            return
+
+        labels = [f"Class {d['abc_class']} ({d['product_count']} products)" for d in data]
+        values = [d.get('total_value', 0) or 0 for d in data]
+        colors = ['#e74c3c', '#f39c12', '#27ae60']  # A=red, B=orange, C=green
+
+        fig = Figure(figsize=(6, 4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        if any(v > 0 for v in values):
+            ax.pie(values, labels=labels, colors=colors[:len(data)],
+                   autopct='%1.1f%%', startangle=90, textprops={'fontsize': 10})
+        else:
+            ax.text(0.5, 0.5, 'No sales data\nRun ABC Recalc', ha='center', va='center',
+                    fontsize=14, color='#7f8c8d', transform=ax.transAxes)
+        ax.set_title('ABC Classification by Value')
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.rpt)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
     # -- Alerts page --
     def show_alerts(self):
         self._clear()
@@ -1452,17 +1795,58 @@ class IARMSApp(tk.Tk):
         tb = ttk.Frame(self.content); tb.pack(fill='x', pady=(0,10))
         ttk.Button(tb, text="➕ Add User", style='Action.TButton',
                    command=self._add_user_dlg).pack(side='left', padx=5)
+        ttk.Button(tb, text="🔑 Change Password", style='Action.TButton',
+                   command=self._change_pw_dlg).pack(side='left', padx=5)
         ttk.Button(tb, text="💾 Backup", style='Action.TButton',
                    command=lambda: messagebox.showinfo("✅",
                        f"Backup: {perform_backup(self.current_user['user_id'])}")).pack(side='left', padx=5)
 
         nb = ttk.Notebook(self.content); nb.pack(fill='both', expand=True)
 
+        # Users tab — now a treeview with deactivation support
         uf = ttk.Frame(nb, padding=10); nb.add(uf, text="Users")
+        ucols = ('username','name','role','email','active','last_login')
+        utree = ttk.Treeview(uf, columns=ucols, show='headings', height=10)
+        for c, h, w in [('username','Username',100),('name','Full Name',180),
+                         ('role','Role',80),('email','Email',180),
+                         ('active','Active',60),('last_login','Last Login',150)]:
+            utree.heading(c, text=h); utree.column(c, width=w)
         for u in get_all_users():
-            ttk.Label(uf, text=f"{u['username']} | {u['full_name']} | {u['role']} | "
-                f"Active: {'Yes' if u['is_active'] else 'No'}").pack(anchor='w', pady=2)
+            tag = '' if u['is_active'] else 'inactive'
+            utree.insert('','end', iid=u['user_id'], values=(
+                u['username'], u['full_name'], u['role'],
+                u.get('email',''), 'Yes' if u['is_active'] else 'No',
+                u.get('last_login', 'Never') or 'Never'), tags=(tag,))
+        utree.tag_configure('inactive', foreground='#95a5a6')
+        utree.pack(fill='both', expand=True)
 
+        # deactivation toggle on double-click
+        def toggle_user(event):
+            sel = utree.selection()
+            if not sel: return
+            uid = int(sel[0])
+            from database import get_connection
+            conn = get_connection()
+            row = conn.execute("SELECT username, is_active FROM users WHERE user_id=?", (uid,)).fetchone()
+            if not row:
+                conn.close(); return
+            if row['username'] == 'admin':
+                conn.close()
+                messagebox.showerror("Error", "Can't deactivate the admin account."); return
+            new_status = 0 if row['is_active'] else 1
+            action = "deactivate" if new_status == 0 else "reactivate"
+            if messagebox.askyesno("Confirm", f"{action.capitalize()} user '{row['username']}'?"):
+                conn.execute("UPDATE users SET is_active=? WHERE user_id=?", (new_status, uid))
+                conn.commit()
+                messagebox.showinfo("✅", f"User {action}d.")
+            conn.close()
+            self.show_admin()
+
+        utree.bind('<Double-1>', toggle_user)
+        ttk.Label(uf, text="💡 Double-click a user to activate/deactivate",
+                  foreground='#7f8c8d', font=('Segoe UI', 9)).pack(anchor='w', pady=(5,0))
+
+        # Audit log tab
         af = ttk.Frame(nb, padding=10); nb.add(af, text="Audit Log")
         cols = ('time','user','action')
         at = ttk.Treeview(af, columns=cols, show='headings', height=15)
@@ -1493,6 +1877,7 @@ class IARMSApp(tk.Tk):
             u, p, n = (fields['username'].get().strip(), fields['password'].get().strip(),
                        fields['full_name'].get().strip())
             if not all([u,p,n]): messagebox.showerror("Error", "Fill required fields."); return
+            if len(p) < 6: messagebox.showerror("Error", "Password must be at least 6 characters."); return
             try:
                 create_user(u, p, n, rv.get(), fields['email'].get(), self.current_user['user_id'])
                 messagebox.showinfo("✅", "User created!"); d.destroy(); self.show_admin()
@@ -1500,3 +1885,36 @@ class IARMSApp(tk.Tk):
                 messagebox.showerror("Error", str(e))
         ttk.Button(f, text="💾 Create", style='Action.TButton', command=save).grid(
             row=6, column=0, columnspan=2, pady=20, sticky='ew')
+
+    def _change_pw_dlg(self):
+        """Dialog to change the current user's password."""
+        from modules.admin import change_password
+        d = tk.Toplevel(self); d.title("Change Password"); d.geometry("380x280")
+        d.transient(self); d.grab_set()
+        f = ttk.Frame(d, padding=20); f.pack(fill='both', expand=True)
+        ttk.Label(f, text="Change Password", style='Header.TLabel').grid(
+            row=0, column=0, columnspan=2, pady=(0,15), sticky='w')
+
+        old_v, new_v, confirm_v = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        for i, (l, v) in enumerate([("Current:", old_v), ("New:", new_v), ("Confirm:", confirm_v)], start=1):
+            ttk.Label(f, text=l).grid(row=i, column=0, sticky='w', pady=5)
+            ttk.Entry(f, textvariable=v, show='•', width=25).grid(row=i, column=1, padx=10, pady=5)
+
+        def save():
+            old, new, confirm = old_v.get(), new_v.get(), confirm_v.get()
+            if not old or not new:
+                messagebox.showerror("Error", "Fill all fields."); return
+            if new != confirm:
+                messagebox.showerror("Error", "New passwords don't match."); return
+            if len(new) < 6:
+                messagebox.showerror("Error", "Password must be at least 6 characters."); return
+            try:
+                change_password(self.current_user['user_id'], old, new)
+                messagebox.showinfo("✅", "Password changed successfully!"); d.destroy()
+            except ValueError as e:
+                messagebox.showerror("Error", str(e))
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(f, text="🔑 Change", style='Action.TButton', command=save).grid(
+            row=4, column=0, columnspan=2, pady=20, sticky='ew')

@@ -70,3 +70,51 @@ def validate_required_fields(data, required):
         if val is None or str(val).strip() == '':
             missing.append(field)
     return missing
+
+
+import re
+
+def validate_phone(phone):
+    """Check if a phone number looks reasonable (digits, spaces, dashes, plus sign). 
+    Returns (is_valid, cleaned_number)."""
+    if not phone or not phone.strip():
+        return True, ''  # blank is ok, phone isn't always required
+    cleaned = re.sub(r'[\s\-\(\)]', '', phone.strip())
+    if not re.match(r'^\+?\d{7,15}$', cleaned):
+        return False, phone
+    return True, cleaned
+
+
+def validate_email(email):
+    """Basic email check — not bulletproof but catches obvious mistakes."""
+    if not email or not email.strip():
+        return True  # blank is fine
+    return bool(re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$', email.strip()))
+
+
+def validate_gst(gst):
+    """
+    Indian GST number format: 15 characters total.
+    Example: 22AAAAA0000A1Z5
+    Pattern: 2 digits + 5 letters (PAN) + 4 digits + 1 letter + 1 alphanumeric + Z + 1 alphanumeric
+    Returns True if blank or valid.
+    """
+    if not gst or not gst.strip():
+        return True
+    return bool(re.match(r'^\d{2}[A-Z]{5}\d{4}[A-Z]\dZ[A-Z\d]$', gst.strip().upper()))
+
+
+def validate_positive_number(value, field_name="Value", allow_zero=True):
+    """
+    Try to parse a numeric string and check that it's non-negative.
+    Returns (is_valid, parsed_float, error_message).
+    """
+    try:
+        num = float(value)
+        if num < 0:
+            return False, 0, f"{field_name} can't be negative"
+        if not allow_zero and num == 0:
+            return False, 0, f"{field_name} must be greater than zero"
+        return True, num, ""
+    except (ValueError, TypeError):
+        return False, 0, f"{field_name} must be a number"
