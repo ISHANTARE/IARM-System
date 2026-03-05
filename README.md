@@ -1,6 +1,6 @@
 # IARMS — Inventory & Accounts Receivable Management System
 
-A desktop application built for **Prapti Seva LLP** to manage product inventory, customer invoicing, payment tracking, and financial reporting — all in one place.
+A desktop application built to manage product inventory, customer invoicing, payment tracking, and financial reporting — all in one place.
 
 Built with Python and Tkinter. Uses SQLite for local data storage. No external services or internet connection required.
 
@@ -120,12 +120,6 @@ No external dependencies. Runs on Windows, macOS, and Linux.
 
 ---
 
-## Screenshots
-
-> _Add screenshots of the Dashboard, Invoice page, and Inventory page here._
-
----
-
 ## Contributing
 
 1. Fork the repository
@@ -142,6 +136,3 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ---
 
-## Acknowledgements
-
-Built for **Prapti Seva LLP** as an internal inventory and accounts management tool.
