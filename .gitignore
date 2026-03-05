@@ -1,0 +1,35 @@
+# Database
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# IDE / editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# App-generated folders (data, not code)
+backups/
+exports/

@@ -1,26 +1,25 @@
 """
-modules/invoice.py
-------------------
-REDESIGNED Invoice System with 3-button lifecycle:
-  1. DISPATCH  → deducts stock, marks as dispatched
-  2. PAYMENT   → auto-records payment, marks as paid
-  3. CANCEL    → reverses stock if dispatched, marks cancelled
+Invoice lifecycle — create → dispatch → payment → done (or cancel at any point).
 
-KEY CHANGE: Stock is NOT deducted at invoice creation.
-            Stock is deducted ONLY when dispatch button is clicked.
+Key design decision:
+  Stock is NOT touched when an invoice is created. It only gets deducted
+  when someone clicks "Dispatch". This way you can draft invoices freely
+  without messing up inventory numbers.
 """
 
 from database import get_connection, log_audit
 from datetime import datetime, timedelta
 
 
-# ═══════════════════════════════════════════
-#  CUSTOMER MANAGEMENT
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Customer management (lives here because customers are tightly coupled
+#  with invoices in this app's workflow)
+# -----------------------------------------------------------------------
 
 def add_customer(customer_name, customer_type='retail', phone='', email='',
                  address='', gst_number='', credit_limit=0, discount_rate=0,
                  payment_terms_days=30):
+    """Add a new customer record."""
     conn = get_connection()
     cid = conn.execute("""
         INSERT INTO customers
@@ -35,15 +34,16 @@ def add_customer(customer_name, customer_type='retail', phone='', email='',
 
 
 def update_customer(customer_id, **kwargs):
+    """Update only the fields that were actually passed in."""
     conn = get_connection()
     allowed = ['customer_name', 'customer_type', 'phone', 'email',
                'address', 'gst_number', 'credit_limit', 'discount_rate',
                'payment_terms_days', 'is_active']
     clauses, vals = [], []
-    for k, v in kwargs.items():
-        if k in allowed:
-            clauses.append(f"{k}=?")
-            vals.append(v)
+    for key, val in kwargs.items():
+        if key in allowed:
+            clauses.append(f"{key}=?")
+            vals.append(val)
     if not clauses:
         conn.close()
         return False
@@ -55,17 +55,19 @@ def update_customer(customer_id, **kwargs):
 
 
 def get_all_customers(active_only=True):
+    """All customers, optionally filtered to active ones only."""
     conn = get_connection()
-    q = "SELECT * FROM customers"
+    query = "SELECT * FROM customers"
     if active_only:
-        q += " WHERE is_active=1"
-    q += " ORDER BY customer_name"
-    rows = conn.execute(q).fetchall()
+        query += " WHERE is_active=1"
+    query += " ORDER BY customer_name"
+    rows = conn.execute(query).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_customer(customer_id):
+    """Fetch one customer by ID."""
     conn = get_connection()
     row = conn.execute("SELECT * FROM customers WHERE customer_id=?",
                        (customer_id,)).fetchone()
@@ -74,6 +76,7 @@ def get_customer(customer_id):
 
 
 def search_customers(term):
+    """Quick search by name or phone number."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT * FROM customers
@@ -85,6 +88,7 @@ def search_customers(term):
 
 
 def get_customer_outstanding(customer_id):
+    """How much does this customer owe us across all open invoices?"""
     conn = get_connection()
     row = conn.execute("""
         SELECT COALESCE(SUM(balance_due),0) as total
@@ -94,51 +98,54 @@ def get_customer_outstanding(customer_id):
     return row['total'] if row else 0
 
 
-# ═══════════════════════════════════════════
-#  INVOICE CREATION (NO STOCK DEDUCTION!)
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Invoice creation — no stock changes happen here
+# -----------------------------------------------------------------------
 
 def _gen_invoice_number(conn):
-    """Generate sequential invoice number."""
+    """
+    Generate the next sequential invoice number like INV-2026-00001.
+    Uses the current year as a prefix so numbering resets each year.
+    """
     year = datetime.now().year
     prefix = f"INV-{year}-"
     row = conn.execute(
         "SELECT invoice_number FROM invoices WHERE invoice_number LIKE ? "
         "ORDER BY invoice_id DESC LIMIT 1", (f"{prefix}%",)).fetchone()
-    num = int(row['invoice_number'].split('-')[-1]) + 1 if row else 1
-    return f"{prefix}{num:05d}"
+    seq = int(row['invoice_number'].split('-')[-1]) + 1 if row else 1
+    return f"{prefix}{seq:05d}"
 
 
 def create_invoice(customer_id, invoice_date, due_date, items,
                    remarks='', user_id=None):
     """
-    Create invoice WITHOUT deducting stock.
-    Stock is only deducted when dispatched.
-    
-    items: list of dicts with product_id, product_name, quantity,
+    Create an invoice with line items. Stock is left alone at this stage —
+    that happens later when dispatch is triggered.
+
+    items: list of dicts, each with product_id, product_name, quantity,
            unit_price, discount_percent, gst_rate
-    
+
     Returns: (invoice_id, invoice_number)
     """
     conn = get_connection()
     try:
         inv_num = _gen_invoice_number(conn)
 
-        # Get customer discount
+        # Grab customer-level discount if any
         cust = conn.execute(
             "SELECT discount_rate FROM customers WHERE customer_id=?",
             (customer_id,)).fetchone()
-        cust_disc = cust['discount_rate'] if cust else 0
+        cust_discount = cust['discount_rate'] if cust else 0
 
         subtotal = 0
-        total_disc = 0
+        total_discount = 0
         total_gst = 0
-        calc_items = []
+        calculated_items = []
 
         for item in items:
             qty = item['quantity']
             price = item['unit_price']
-            disc = item.get('discount_percent', cust_disc)
+            disc = item.get('discount_percent', cust_discount)
             gst_rate = item.get('gst_rate', 18.0)
 
             gross = qty * price
@@ -148,22 +155,22 @@ def create_invoice(customer_id, invoice_date, due_date, items,
             line_total = taxable + gst
 
             subtotal += gross
-            total_disc += discount
+            total_discount += discount
             total_gst += gst
 
-            calc_items.append({
+            calculated_items.append({
                 'product_id': item['product_id'],
                 'quantity': qty,
                 'unit_price': price,
                 'discount_percent': disc,
                 'gst_rate': gst_rate,
                 'gst_amount': round(gst, 2),
-                'line_total': round(line_total, 2)
+                'line_total': round(line_total, 2),
             })
 
-        total_amount = round(subtotal - total_disc + total_gst, 2)
+        total_amount = round(subtotal - total_discount + total_gst, 2)
 
-        # Insert invoice header — status='created', NOT dispatched
+        # Insert the invoice header — status starts as 'created'
         cursor = conn.execute("""
             INSERT INTO invoices
             (invoice_number,customer_id,invoice_date,due_date,
@@ -172,14 +179,14 @@ def create_invoice(customer_id, invoice_date, due_date, items,
              is_dispatched,is_paid,remarks,created_by)
             VALUES (?,?,?,?,?,?,?,?,0,?,'created',0,0,?,?)
         """, (inv_num, customer_id, invoice_date, due_date,
-              round(subtotal, 2), round(total_disc, 2),
+              round(subtotal, 2), round(total_discount, 2),
               round(total_gst, 2), total_amount, total_amount,
               remarks, user_id))
 
         inv_id = cursor.lastrowid
 
-        # Insert line items ONLY — no stock deduction
-        for item in calc_items:
+        # Insert line items (just recording what was ordered, no stock changes)
+        for item in calculated_items:
             conn.execute("""
                 INSERT INTO invoice_items
                 (invoice_id,product_id,quantity,unit_price,
@@ -195,28 +202,24 @@ def create_invoice(customer_id, invoice_date, due_date, items,
         conn.commit()
         return inv_id, inv_num
 
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        raise e
+        raise err
     finally:
         conn.close()
 
 
-# ═══════════════════════════════════════════════════
-#  BUTTON 1: DISPATCH — Deducts stock from inventory
-# ═══════════════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Dispatch — this is where stock actually gets deducted
+# -----------------------------------------------------------------------
 
 def dispatch_invoice(invoice_id, user_id=None):
     """
-    Mark invoice as dispatched and DEDUCT stock.
-    This is when inventory actually gets reduced.
-    
-    Rules:
-    - Cannot dispatch if already dispatched
-    - Cannot dispatch if cancelled
-    - Validates stock availability before dispatching
-    
-    Returns: (success, message)
+    Mark an invoice as dispatched and DEDUCT stock for every line item.
+    Checks stock availability for ALL items first — if anything is short,
+    the whole dispatch is rejected (no partial shipments).
+
+    Returns (success, message).
     """
     conn = get_connection()
     try:
@@ -226,44 +229,42 @@ def dispatch_invoice(invoice_id, user_id=None):
 
         if not inv:
             return False, "Invoice not found"
-
         if inv['is_dispatched'] == 1:
-            return False, "Invoice is already dispatched"
-
+            return False, "Already dispatched"
         if inv['status'] == 'cancelled':
-            return False, "Cannot dispatch a cancelled invoice"
+            return False, "Can't dispatch a cancelled invoice"
 
-        # Get all line items
+        # Pull all line items with current stock levels
         items = conn.execute(
             "SELECT ii.*, p.product_name, p.product_code, p.current_stock, p.unit "
             "FROM invoice_items ii "
             "JOIN products p ON ii.product_id=p.product_id "
             "WHERE ii.invoice_id=?", (invoice_id,)).fetchall()
 
-        # Validate stock for ALL items first
-        stock_errors = []
+        # Check if we have enough of everything before touching anything
+        shortages = []
         for item in items:
             if item['current_stock'] < item['quantity']:
-                stock_errors.append(
+                shortages.append(
                     f"{item['product_code']} {item['product_name']}: "
-                    f"Need {item['quantity']} {item['unit']}, "
-                    f"have {item['current_stock']}"
+                    f"need {item['quantity']} {item['unit']}, "
+                    f"only have {item['current_stock']}"
                 )
 
-        if stock_errors:
-            return False, "Insufficient stock:\n" + "\n".join(stock_errors)
+        if shortages:
+            return False, "Not enough stock:\n" + "\n".join(shortages)
 
-        # All stock OK — deduct for each item
+        # All good — deduct stock for each item
         from modules.inventory import _record_stock_txn
-
         for item in items:
             _record_stock_txn(
                 conn, item['product_id'], 'dispatch', item['quantity'],
                 item['unit_price'], inv['invoice_number'],
-                f"Dispatched via {inv['invoice_number']}", user_id
+                f"Dispatched for {inv['invoice_number']}", user_id
             )
 
-        # Update invoice status
+        # Update the invoice header
+        now = datetime.now().isoformat()
         conn.execute("""
             UPDATE invoices SET
                 status='dispatched',
@@ -272,39 +273,33 @@ def dispatch_invoice(invoice_id, user_id=None):
                 dispatched_by=?,
                 updated_at=?
             WHERE invoice_id=?
-        """, (datetime.now().isoformat(), user_id,
-              datetime.now().isoformat(), invoice_id))
+        """, (now, user_id, now, invoice_id))
 
         log_audit(user_id, 'DISPATCH_INVOICE', 'invoices', invoice_id,
                   {'status': 'created'},
                   {'status': 'dispatched'}, conn)
 
         conn.commit()
-        return True, f"Invoice {inv['invoice_number']} dispatched successfully!"
+        return True, f"Invoice {inv['invoice_number']} dispatched!"
 
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        return False, str(e)
+        return False, str(err)
     finally:
         conn.close()
 
 
-# ═══════════════════════════════════════════════════
-#  BUTTON 2: PAYMENT DONE — Auto-records full payment
-# ═══════════════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Payment — one-click "mark as paid"
+# -----------------------------------------------------------------------
 
 def mark_payment_done(invoice_id, payment_method='cash',
                       payment_reference='', user_id=None):
     """
-    One-click payment: marks invoice as fully paid.
-    Auto-creates payment record — no manual entry needed.
-    
-    Rules:
-    - Must be dispatched first (goods must be sent before payment)
-    - Cannot pay cancelled invoices
-    - Cannot pay already paid invoices
-    
-    Returns: (success, message)
+    Full-payment shortcut — records a payment for the entire outstanding
+    balance and marks the invoice as paid. Goods must be dispatched first.
+
+    Returns (success, message).
     """
     conn = get_connection()
     try:
@@ -314,25 +309,21 @@ def mark_payment_done(invoice_id, payment_method='cash',
 
         if not inv:
             return False, "Invoice not found"
-
         if inv['status'] == 'cancelled':
-            return False, "Cannot pay a cancelled invoice"
-
+            return False, "Can't pay a cancelled invoice"
         if inv['is_paid'] == 1:
-            return False, "Invoice is already paid"
-
+            return False, "Already paid"
         if inv['is_dispatched'] == 0:
             return False, "Dispatch the goods before recording payment"
 
         pay_amount = inv['balance_due']
         pay_date = datetime.now().strftime('%Y-%m-%d')
 
-        # Calculate payment delay
+        # How many days late was the payment (0 if on time)?
         due_date = datetime.strptime(inv['due_date'], '%Y-%m-%d')
-        today = datetime.now()
-        delay = max(0, (today - due_date).days)
+        delay = max(0, (datetime.now() - due_date).days)
 
-        # Auto-create payment record
+        # Create the payment record
         conn.execute("""
             INSERT INTO payments
             (invoice_id,payment_date,amount,payment_method,
@@ -340,10 +331,10 @@ def mark_payment_done(invoice_id, payment_method='cash',
             VALUES (?,?,?,?,?,?,1,?)
         """, (invoice_id, pay_date, pay_amount, payment_method,
               payment_reference,
-              f"Auto-payment for {inv['invoice_number']}",
+              f"Full payment for {inv['invoice_number']}",
               user_id))
 
-        # Update invoice
+        # Close out the invoice
         conn.execute("""
             UPDATE invoices SET
                 status='paid',
@@ -369,25 +360,23 @@ def mark_payment_done(invoice_id, payment_method='cash',
         return True, (f"Payment of ₹{pay_amount:,.2f} recorded for "
                        f"{inv['invoice_number']}")
 
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        return False, str(e)
+        return False, str(err)
     finally:
         conn.close()
 
 
-# ═══════════════════════════════════════════════════
-#  BUTTON 3: CANCEL — Reverses everything
-# ═══════════════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Cancellation — undoes everything
+# -----------------------------------------------------------------------
 
 def cancel_invoice(invoice_id, reason='', user_id=None):
     """
-    Cancel an invoice.
-    - If dispatched: reverses stock deductions
-    - If paid: cannot cancel (must refund first)
-    - If just created: simply marks as cancelled
-    
-    Returns: (success, message)
+    Cancel an invoice. If it was already dispatched, this reverses the
+    stock deductions. Can't cancel a paid invoice (you'd need a refund).
+
+    Returns (success, message).
     """
     conn = get_connection()
     try:
@@ -397,15 +386,13 @@ def cancel_invoice(invoice_id, reason='', user_id=None):
 
         if not inv:
             return False, "Invoice not found"
-
         if inv['status'] == 'cancelled':
-            return False, "Invoice is already cancelled"
-
+            return False, "Already cancelled"
         if inv['is_paid'] == 1:
-            return False, ("Cannot cancel a paid invoice. "
-                           "Issue a credit note / refund first.")
+            return False, ("Can't cancel a paid invoice. "
+                           "You'll need to issue a credit note / refund first.")
 
-        # If dispatched, reverse stock
+        # If goods were dispatched, put the stock back
         if inv['is_dispatched'] == 1:
             items = conn.execute(
                 "SELECT * FROM invoice_items WHERE invoice_id=?",
@@ -420,7 +407,7 @@ def cancel_invoice(invoice_id, reason='', user_id=None):
                     user_id
                 )
 
-        # Mark as cancelled
+        now = datetime.now().isoformat()
         conn.execute("""
             UPDATE invoices SET
                 status='cancelled',
@@ -429,30 +416,29 @@ def cancel_invoice(invoice_id, reason='', user_id=None):
                 cancel_reason=?,
                 updated_at=?
             WHERE invoice_id=?
-        """, (datetime.now().isoformat(), user_id, reason,
-              datetime.now().isoformat(), invoice_id))
+        """, (now, user_id, reason, now, invoice_id))
 
-        stock_msg = " Stock has been reversed." if inv['is_dispatched'] else ""
+        stock_note = " Stock has been reversed." if inv['is_dispatched'] else ""
         log_audit(user_id, 'CANCEL_INVOICE', 'invoices', invoice_id,
                   {'status': inv['status']},
                   {'status': 'cancelled', 'reason': reason}, conn)
 
         conn.commit()
-        return True, f"Invoice {inv['invoice_number']} cancelled.{stock_msg}"
+        return True, f"Invoice {inv['invoice_number']} cancelled.{stock_note}"
 
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        return False, str(e)
+        return False, str(err)
     finally:
         conn.close()
 
 
-# ═══════════════════════════════════════════
-#  INVOICE QUERIES
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Invoice queries
+# -----------------------------------------------------------------------
 
 def get_invoice(invoice_id):
-    """Get complete invoice with items and payments."""
+    """Get the full invoice with line items, payments, and user names."""
     conn = get_connection()
     row = conn.execute("""
         SELECT i.*, c.customer_name, c.gst_number, c.address, c.phone,
@@ -475,7 +461,7 @@ def get_invoice(invoice_id):
 
     invoice = dict(row)
 
-    # Line items with product details
+    # Line items
     items = conn.execute("""
         SELECT ii.*, p.product_name, p.product_code, p.unit
         FROM invoice_items ii
@@ -484,7 +470,7 @@ def get_invoice(invoice_id):
     """, (invoice_id,)).fetchall()
     invoice['items'] = [dict(i) for i in items]
 
-    # Payments
+    # Payment records
     payments = conn.execute("""
         SELECT p.*, u.full_name as recorded_by
         FROM payments p
@@ -499,7 +485,7 @@ def get_invoice(invoice_id):
 
 
 def get_invoice_with_items_summary(invoice_id):
-    """Get invoice with a text summary of items for list display."""
+    """Get an invoice with a short text summary of its items (for list views)."""
     conn = get_connection()
     row = conn.execute("""
         SELECT i.*, c.customer_name
@@ -514,7 +500,6 @@ def get_invoice_with_items_summary(invoice_id):
 
     inv = dict(row)
 
-    # Build items summary
     items = conn.execute("""
         SELECT p.product_name, p.product_code, ii.quantity, p.unit,
             ii.unit_price, ii.line_total
@@ -534,9 +519,12 @@ def get_invoice_with_items_summary(invoice_id):
 
 
 def get_all_invoices(status_filter=None, customer_id=None):
-    """Get all invoices with item summaries for list display."""
+    """
+    All invoices for the list view. Each row includes a comma-separated
+    summary of items so you can see what was ordered at a glance.
+    """
     conn = get_connection()
-    q = """
+    query = """
         SELECT i.*,
             c.customer_name,
             GROUP_CONCAT(
@@ -552,21 +540,21 @@ def get_all_invoices(status_filter=None, customer_id=None):
     params = []
 
     if status_filter and status_filter != 'all':
-        q += " AND i.status=?"
+        query += " AND i.status=?"
         params.append(status_filter)
     if customer_id:
-        q += " AND i.customer_id=?"
+        query += " AND i.customer_id=?"
         params.append(customer_id)
 
-    q += " GROUP BY i.invoice_id ORDER BY i.invoice_date DESC, i.invoice_id DESC"
+    query += " GROUP BY i.invoice_id ORDER BY i.invoice_date DESC, i.invoice_id DESC"
 
-    rows = conn.execute(q, params).fetchall()
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_all_invoices_detailed():
-    """Get all invoices with full item details for expanded view."""
+    """All invoices with full item details (for detailed/expanded views)."""
     conn = get_connection()
     invoices = conn.execute("""
         SELECT i.*, c.customer_name
@@ -577,7 +565,7 @@ def get_all_invoices_detailed():
 
     result = []
     for inv in invoices:
-        d = dict(inv)
+        entry = dict(inv)
         items = conn.execute("""
             SELECT p.product_code, p.product_name, ii.quantity, p.unit,
                 ii.unit_price, ii.line_total
@@ -585,29 +573,32 @@ def get_all_invoices_detailed():
             JOIN products p ON ii.product_id=p.product_id
             WHERE ii.invoice_id=?
         """, (inv['invoice_id'],)).fetchall()
-        d['items'] = [dict(i) for i in items]
-        result.append(d)
+        entry['items'] = [dict(i) for i in items]
+        result.append(entry)
 
     conn.close()
     return result
 
 
 def update_overdue_invoices():
-    """Mark overdue invoices."""
+    """Sweep through open invoices and mark any past-due ones as overdue."""
     conn = get_connection()
     today = datetime.now().strftime('%Y-%m-%d')
-    cnt = conn.execute("""
+    count = conn.execute("""
         UPDATE invoices SET status='overdue', updated_at=?
         WHERE due_date<? AND status IN ('created','dispatched')
           AND balance_due>0 AND is_paid=0
     """, (datetime.now().isoformat(), today)).rowcount
     conn.commit()
     conn.close()
-    return cnt
+    return count
 
 
 def check_credit_limit(customer_id, new_amount):
-    """Check credit limit."""
+    """
+    Check whether a new invoice would push the customer past their credit limit.
+    Returns (within_limit, current_outstanding, limit).
+    """
     cust = get_customer(customer_id)
     if not cust or cust['credit_limit'] <= 0:
         return True, 0, 0

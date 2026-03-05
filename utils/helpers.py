@@ -1,21 +1,19 @@
 """
-utils/helpers.py
-----------------
-Common helper functions.
+General-purpose helpers — date formatting, validation, currency display.
 """
 
 from datetime import datetime, timedelta
 
 
 def format_currency(amount):
-    """Format as Indian Rupee."""
+    """Format a number as Indian Rupees (₹1,23,456.00 style)."""
     if amount is None:
         return "₹0.00"
     return f"₹{amount:,.2f}"
 
 
 def format_date(date_str, input_fmt='%Y-%m-%d', output_fmt='%d-%b-%Y'):
-    """Convert date string between formats."""
+    """Convert a date string from one format to another."""
     if not date_str:
         return ""
     try:
@@ -25,7 +23,7 @@ def format_date(date_str, input_fmt='%Y-%m-%d', output_fmt='%d-%b-%Y'):
 
 
 def validate_date(date_str, fmt='%Y-%m-%d'):
-    """Validate a date string. Returns True if valid."""
+    """Check if a string is a valid date in the given format."""
     try:
         datetime.strptime(date_str, fmt)
         return True
@@ -34,8 +32,12 @@ def validate_date(date_str, fmt='%Y-%m-%d'):
 
 
 def get_date_range(period='month'):
-    """Return (start_date, end_date) strings."""
+    """
+    Get start and end dates for common time periods.
+    Returns a tuple of (start_date, end_date) as YYYY-MM-DD strings.
+    """
     today = datetime.now()
+
     if period == 'today':
         start = end = today
     elif period == 'week':
@@ -45,8 +47,8 @@ def get_date_range(period='month'):
         start = today.replace(day=1)
         end = today
     elif period == 'quarter':
-        qm = ((today.month - 1) // 3) * 3 + 1
-        start = today.replace(month=qm, day=1)
+        quarter_start_month = ((today.month - 1) // 3) * 3 + 1
+        start = today.replace(month=quarter_start_month, day=1)
         end = today
     elif period == 'year':
         start = today.replace(month=1, day=1)
@@ -58,7 +60,10 @@ def get_date_range(period='month'):
 
 
 def validate_required_fields(data, required):
-    """Check all required fields are present and non-empty."""
+    """
+    Check that all required fields are present and non-empty.
+    Returns a list of field names that are missing.
+    """
     missing = []
     for field in required:
         val = data.get(field)

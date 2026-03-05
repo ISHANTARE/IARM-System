@@ -1,14 +1,11 @@
 """
-gui/app.py
-----------
-REDESIGNED GUI with:
-- Invoice shows product details (what was bought, quantities)
-- 3 action buttons per invoice: Dispatch | Payment Done | Cancel
-- Enhanced dashboard with dispatch/payment pending counts
+Main application window — Tkinter GUI for IARMS.
+Handles login, navigation sidebar, and all the tab views
+(dashboard, inventory, customers, invoices, payments, reports, admin).
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime, timedelta
 
 from database import initialize_database
@@ -45,7 +42,7 @@ class IARMSApp(tk.Tk):
         s.configure('Treeview', font=('Segoe UI', 10), rowheight=28)
         s.configure('Treeview.Heading', font=('Segoe UI', 10, 'bold'))
 
-    # ─── LOGIN ───
+    # -- Login screen --
     def show_login(self):
         for w in self.winfo_children(): w.destroy()
         f = ttk.Frame(self, padding=40)
@@ -93,7 +90,7 @@ class IARMSApp(tk.Tk):
     def _main_ui(self):
         for w in self.winfo_children(): w.destroy()
 
-        # Top bar
+        # Top bar with user info and logout
         top = ttk.Frame(self, padding=5)
         top.pack(fill='x', side='top')
         ttk.Label(top, text="IARMS - Prapti Seva LLP",
@@ -141,7 +138,7 @@ class IARMSApp(tk.Tk):
     def _clear(self):
         for w in self.content.winfo_children(): w.destroy()
 
-    # ─── DASHBOARD ───
+    # -- Dashboard --
     def show_dashboard(self):
         self._clear()
         from modules.reporting import get_dashboard_kpis
@@ -156,13 +153,13 @@ class IARMSApp(tk.Tk):
         r1 = ttk.Frame(self.content)
         r1.pack(fill='x', pady=5)
         for title, val, sub in [
-            ("Today's Sales", format_currency(kpis['daily'].get('today_revenue',0)),
-             f"{kpis['daily'].get('today_invoices',0)} invoices"),
-            ("Monthly Revenue", format_currency(kpis['monthly'].get('month_revenue',0)),
-             f"{kpis['monthly'].get('month_invoices',0)} invoices"),
-            ("Outstanding", format_currency(kpis['sales'].get('total_outstanding',0)),
-             f"{kpis['sales'].get('overdue_count',0)} overdue"),
-            ("DSO", f"{kpis.get('dso',0)} days", "Days Sales Outstanding"),
+            ("Today's Sales", format_currency(kpis['daily'].get('today_revenue',0) or 0),
+             f"{kpis['daily'].get('today_invoices',0) or 0} invoices"),
+            ("Monthly Revenue", format_currency(kpis['monthly'].get('month_revenue',0) or 0),
+             f"{kpis['monthly'].get('month_invoices',0) or 0} invoices"),
+            ("Outstanding", format_currency(kpis['sales'].get('total_outstanding',0) or 0),
+             f"{kpis['sales'].get('overdue_count',0) or 0} overdue"),
+            ("DSO", f"{kpis.get('dso',0) or 0} days", "Days Sales Outstanding"),
         ]:
             c = ttk.LabelFrame(r1, text=title, padding=15)
             c.pack(side='left', fill='both', expand=True, padx=5)
@@ -173,8 +170,12 @@ class IARMSApp(tk.Tk):
         r2 = ttk.Frame(self.content)
         r2.pack(fill='x', pady=5)
 
-        pending_dispatch = kpis['sales'].get('pending_dispatch', 0)
-        dispatched_unpaid = kpis['sales'].get('dispatched_unpaid', 0)
+        pending_dispatch = kpis['sales'].get('pending_dispatch', 0) or 0
+        dispatched_unpaid = kpis['sales'].get('dispatched_unpaid', 0) or 0
+
+        low_stock = kpis['inventory'].get('low_stock_count', 0) or 0
+        total_products = kpis['inventory'].get('total_products', 0) or 0
+        inv_value = kpis['inventory'].get('total_inventory_value', 0) or 0
 
         for title, val, sub, color in [
             ("Pending Dispatch", str(pending_dispatch),
@@ -183,11 +184,11 @@ class IARMSApp(tk.Tk):
             ("Dispatched Unpaid", str(dispatched_unpaid),
              "Awaiting payment",
              '#f39c12' if dispatched_unpaid > 0 else '#27ae60'),
-            ("Low Stock", str(kpis['inventory'].get('low_stock_count',0)),
+            ("Low Stock", str(low_stock),
              "Need reorder",
-             '#e74c3c' if kpis['inventory'].get('low_stock_count',0) > 0 else '#27ae60'),
-            ("Inventory Value", format_currency(kpis['inventory'].get('total_inventory_value',0)),
-             f"{kpis['inventory'].get('total_products',0)} products", '#2c3e50'),
+             '#e74c3c' if low_stock > 0 else '#27ae60'),
+            ("Inventory Value", format_currency(inv_value),
+             f"{total_products} products", '#2c3e50'),
         ]:
             c = ttk.LabelFrame(r2, text=title, padding=15)
             c.pack(side='left', fill='both', expand=True, padx=5)
@@ -210,7 +211,7 @@ class IARMSApp(tk.Tk):
             ttk.Label(af, text="✅ All clear!", foreground='#27ae60',
                       font=('Segoe UI',11)).pack(anchor='w')
 
-    # ─── INVENTORY (same as before, abbreviated for space) ───
+    # -- Inventory management --
     def show_inventory(self):
         self._clear()
         from modules.inventory import (get_all_products, search_products,
@@ -346,7 +347,7 @@ class IARMSApp(tk.Tk):
         ttk.Button(f, text="💾 Save", style='Action.TButton', command=save).grid(
             row=4, column=0, columnspan=2, pady=20, sticky='ew')
 
-    # ─── CUSTOMERS ───
+    # -- Customer management --
     def show_customers(self):
         self._clear()
         from modules.invoice import get_all_customers, search_customers, get_customer_outstanding
@@ -423,12 +424,10 @@ class IARMSApp(tk.Tk):
         ttk.Button(f, text="💾 Save", style='Action.TButton', command=save).grid(
             row=r+1, column=0, columnspan=2, pady=20, sticky='ew')
 
-    # ══════════════════════════════════════════════════════════════════
-    #  INVOICES — COMPLETELY REDESIGNED WITH 3 BUTTONS + ITEM DETAILS
-    # ══════════════════════════════════════════════════════════════════
+    # -- Invoice management (with dispatch/pay/cancel buttons) --
 
     def show_invoices(self):
-        """Invoice management with item details and 3 action buttons."""
+        """Invoice list view with item details and action buttons."""
         self._clear()
         from modules.invoice import get_all_invoices
 
@@ -495,7 +494,7 @@ class IARMSApp(tk.Tk):
         populate()
 
     def _render_invoice_card(self, parent, inv):
-        """Render a single invoice card with item details and 3 buttons."""
+        """Draw one invoice card with status, items, and action buttons."""
         from modules.invoice import dispatch_invoice, mark_payment_done, cancel_invoice
 
         # Color coding
@@ -631,10 +630,10 @@ class IARMSApp(tk.Tk):
         )
         view_btn.pack(side='left', padx=3)
 
-    # ─── BUTTON ACTIONS ───
+    # -- Invoice action handlers --
 
     def _do_dispatch(self, invoice_id):
-        """Handle Dispatch button click."""
+        """Confirm and dispatch an invoice (deducts stock)."""
         from modules.invoice import dispatch_invoice
 
         if not messagebox.askyesno(
@@ -654,7 +653,7 @@ class IARMSApp(tk.Tk):
         self.show_invoices()
 
     def _do_payment(self, invoice_id):
-        """Handle Payment Done button click — with method selection."""
+        """Open a small dialog to pick payment method, then mark as paid."""
         from modules.invoice import mark_payment_done, get_invoice
 
         inv = get_invoice(invoice_id)
@@ -701,18 +700,17 @@ class IARMSApp(tk.Tk):
                    command=confirm).pack(fill='x', pady=15, ipady=5)
 
     def _do_cancel(self, invoice_id):
-        """Handle Cancel button click."""
+        """Ask for a reason (optional), then cancel the invoice."""
         from modules.invoice import cancel_invoice
 
-        reason = tk.simpledialog.askstring(
+        reason = simpledialog.askstring(
             "Cancel Reason",
-            "Why is this invoice being cancelled?\n(Leave blank if just for reference)",
+            "Why is this invoice being cancelled?\n(Leave blank if not needed)",
             parent=self
-        ) if hasattr(tk, 'simpledialog') else ''
+        )
 
-        # Fallback if simpledialog not available
+        # User hit the X or pressed Cancel on the dialog
         if reason is None:
-            # Simple confirmation instead
             if not messagebox.askyesno(
                 "Cancel Invoice",
                 "Cancel this invoice?\n"
@@ -731,7 +729,7 @@ class IARMSApp(tk.Tk):
         self.show_invoices()
 
     def _view_invoice(self, invoice_id):
-        """View full invoice details."""
+        """Pop up a detailed invoice view with items, totals, and payment history."""
         from modules.invoice import get_invoice
 
         inv = get_invoice(invoice_id)
@@ -827,7 +825,7 @@ class IARMSApp(tk.Tk):
                          f"{p['payment_method']}{auto} | Ref: {p.get('reference_no','N/A')}",
                     font=('Segoe UI',10)).pack(anchor='w')
 
-    # ─── CREATE INVOICE (same as before but NO stock deduction) ───
+    # -- Create invoice dialog --
 
     def _create_invoice_dlg(self):
         from modules.invoice import get_all_customers, create_invoice, check_credit_limit
@@ -989,10 +987,9 @@ class IARMSApp(tk.Tk):
         ttk.Button(footer, text="💾  CREATE INVOICE  💾", style='Save.TButton',
                    command=save).pack(side='right', ipadx=20, ipady=5)
 
-    # ─── PAYMENTS ───
-        # ─── PAYMENTS PAGE — FIXED WITH PROPER LIST VIEW ───
+    # -- Payments page --
     def show_payments(self):
-        """Payment records page showing all payments in a detailed list."""
+        """Payment records with filters, summaries, and a sortable table."""
         self._clear()
         from database import get_connection
 
@@ -1280,7 +1277,7 @@ class IARMSApp(tk.Tk):
         populate()
 
     def _sort_payment_tree(self, tree, col, reverse):
-        """Sort treeview by column."""
+        """Sort the payment table when a column header is clicked."""
         data = [(tree.set(child, col), child)
                 for child in tree.get_children('')]
 
@@ -1305,7 +1302,7 @@ class IARMSApp(tk.Tk):
             tree, col, not reverse))
 
     def _view_payment_invoice(self, tree):
-        """Open invoice detail from payment record."""
+        """Double-click a payment row to jump to its invoice details."""
         sel = tree.selection()
         if not sel:
             return
@@ -1325,7 +1322,7 @@ class IARMSApp(tk.Tk):
             self._view_invoice(row['invoice_id'])
 
     def _copy_payment_ref(self, tree):
-        """Copy payment reference to clipboard."""
+        """Copy the reference number to clipboard."""
         sel = tree.selection()
         if not sel:
             return
@@ -1335,7 +1332,7 @@ class IARMSApp(tk.Tk):
             self.clipboard_append(ref)
             messagebox.showinfo("Copied", f"Reference '{ref}' copied to clipboard.")
 
-    # ─── REPORTS (abbreviated — same structure as before) ───
+    # -- Reports & analytics --
     def show_reports(self):
         self._clear()
         ttk.Label(self.content, text="Reports & Analytics", style='Title.TLabel').pack(anchor='w', pady=(0,15))
@@ -1431,7 +1428,7 @@ class IARMSApp(tk.Tk):
                 format_currency(d['outstanding'])))
         tree.pack(fill='both', expand=True)
 
-    # ─── ALERTS ───
+    # -- Alerts page --
     def show_alerts(self):
         self._clear()
         from utils.alerts import get_all_alerts
@@ -1446,7 +1443,7 @@ class IARMSApp(tk.Tk):
             ttk.Label(self.content, text=f"{icon} [{a['type']}] {a['message']}",
                       foreground=fg, font=('Segoe UI',10)).pack(anchor='w', pady=2)
 
-    # ─── ADMIN ───
+    # -- Admin panel --
     def show_admin(self):
         self._clear()
         from modules.admin import get_all_users, get_audit_log, perform_backup

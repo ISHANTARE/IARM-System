@@ -1,12 +1,10 @@
 """
-models.py
----------
-Data classes representing the core business entities.
+Data models — plain dataclasses for the core business objects.
+Nothing fancy, just structured containers for passing data around.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional, List
-from datetime import datetime, date
 
 
 @dataclass

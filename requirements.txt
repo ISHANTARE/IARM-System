@@ -1,0 +1,7 @@
+# IARMS uses only the Python standard library.
+# No pip packages needed — just make sure you have Python 3.8+.
+#
+# Tkinter is required but ships with most Python installs.
+# If it's missing on Linux, install it via:
+#   sudo apt-get install python3-tk     (Debian/Ubuntu)
+#   sudo dnf install python3-tkinter    (Fedora)

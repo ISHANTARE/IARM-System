@@ -1,30 +1,28 @@
 """
-IARMS v3.0 — Redesigned Invoice System
-Login: admin / admin123
+Entry point for IARMS.
+Boots up the database and launches the desktop GUI.
+
+Default login: admin / admin123
 """
 
 from database import initialize_database
 from gui.app import IARMSApp
+from config import APP_NAME, COMPANY_NAME, VERSION
+
 
 def main():
     print("=" * 60)
-    print("  IARMS v3.0 - Prapti Seva LLP")
-    print("  Inventory & Accounts Receivable Management System")
+    print(f"  {APP_NAME}")
+    print(f"  {COMPANY_NAME}  —  v{VERSION}")
     print("=" * 60)
     print()
 
-    # DELETE OLD DATABASE for clean start with new schema
-    import os
-    if os.path.exists("iarms.db"):
-        print("[!] Detected old database. Backing up and recreating...")
-        import shutil
-        shutil.copy2("iarms.db", "iarms_old_backup.db")
-        os.remove("iarms.db")
-
     initialize_database()
-    print("[STARTUP] Launching...")
+    print("[startup] Launching the GUI...")
+
     app = IARMSApp()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()

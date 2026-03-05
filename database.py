@@ -1,26 +1,20 @@
 """
-database.py
------------
-Complete database layer with dispatch tracking support.
+Database layer — handles connection, schema creation, seeding,
+password hashing, backups, and audit logging.
+
+Everything goes through SQLite.
 """
 
 import sqlite3
-import os
-import shutil
 import hashlib
+import shutil
 from datetime import datetime
 
-DB_NAME = "iarms.db"
-BACKUP_DIR = "backups"
-EXPORT_DIR = "exports"
-
-for d in [BACKUP_DIR, EXPORT_DIR]:
-    if not os.path.exists(d):
-        os.makedirs(d)
+from config import DB_NAME, BACKUP_DIR
 
 
 def get_connection():
-    """Return a new connection to the SQLite database."""
+    """Grab a fresh SQLite connection with foreign keys turned on."""
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
@@ -28,16 +22,26 @@ def get_connection():
 
 
 def hash_password(password):
-    """Hash a password using SHA-256."""
+    """
+    Quick SHA-256 hash for passwords.
+
+    NOTE: SHA-256 is technically not ideal for password storage (it's too fast,
+    making brute-force easier). For a production system you'd want bcrypt or
+    argon2, but those need pip-installed packages. Keeping it simple for now.
+    """
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+# -----------------------------------------------------------------------
+#  Schema setup — runs once on first launch, harmless on subsequent runs
+# -----------------------------------------------------------------------
+
 def initialize_database():
-    """Create all tables and seed data."""
+    """Create tables if they don't exist yet, and seed initial data."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # ── Users ──
+    # -- Users table --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +56,7 @@ def initialize_database():
         )
     """)
 
-    # ── Categories ──
+    # -- Categories --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS categories (
             category_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +65,7 @@ def initialize_database():
         )
     """)
 
-    # ── Products ──
+    # -- Products --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             product_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +87,7 @@ def initialize_database():
         )
     """)
 
-    # ── Stock Transactions ──
+    # -- Stock transaction log --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_transactions (
             transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +108,7 @@ def initialize_database():
         )
     """)
 
-    # ── Customers ──
+    # -- Customers --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             customer_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +128,7 @@ def initialize_database():
         )
     """)
 
-    # ── Invoices (REDESIGNED with dispatch tracking) ──
+    # -- Invoices (with dispatch tracking) --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS invoices (
             invoice_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,7 +169,7 @@ def initialize_database():
         )
     """)
 
-    # ── Invoice Line Items ──
+    # -- Invoice line items --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS invoice_items (
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +187,7 @@ def initialize_database():
         )
     """)
 
-    # ── Payments ──
+    # -- Payments --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,7 +208,7 @@ def initialize_database():
         )
     """)
 
-    # ── Audit Log ──
+    # -- Audit trail --
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             log_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,7 +223,8 @@ def initialize_database():
         )
     """)
 
-    # ── Seed Data ──
+    # ---- Seed default data if the tables are empty ----
+
     cursor.execute("SELECT COUNT(*) as cnt FROM users")
     if cursor.fetchone()['cnt'] == 0:
         hashed = hash_password('admin123')
@@ -229,6 +234,7 @@ def initialize_database():
                     'admin@praptiseva.com')
         """, (hashed,))
     else:
+        # If the DB already has users, make sure their passwords are hashed
         _migrate_passwords(cursor)
 
     cursor.execute("SELECT COUNT(*) as cnt FROM categories")
@@ -239,22 +245,28 @@ def initialize_database():
                 ('Household Goods', 'Kitchen, cleaning, home essentials'),
                 ('Personal Care', 'Soaps, shampoos, skincare'),
                 ('Construction Equipment', 'Tools, machinery, materials'),
-                ('General', 'Uncategorized')
+                ('General', 'Uncategorized'),
             ]
         )
 
     conn.commit()
     conn.close()
-    print("[DB] Database initialized successfully.")
+    print("[db] Database ready.")
 
 
 def _migrate_passwords(cursor):
-    """Detect and migrate plain-text passwords to SHA-256."""
+    """
+    Legacy helper — if an older DB still stores plaintext passwords in a
+    column called 'password' (no _hash suffix), this renames the column
+    and hashes everything. Safe to call repeatedly; it won't do anything
+    if the schema is already up to date.
+    """
     try:
         cursor.execute("PRAGMA table_info(users)")
         columns = [col['name'] for col in cursor.fetchall()]
 
         if 'password' in columns and 'password_hash' not in columns:
+            # Old schema — need to rebuild the table with the new column name
             cursor.execute("""
                 CREATE TABLE users_new (
                     user_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,18 +290,22 @@ def _migrate_passwords(cursor):
             cursor.execute("DROP TABLE users")
             cursor.execute("ALTER TABLE users_new RENAME TO users")
 
+        # Hash any passwords that are still stored as plaintext
         cursor.execute("SELECT user_id, username, password_hash FROM users")
         for user in cursor.fetchall():
             pwd = user['password_hash']
-            is_hashed = (len(pwd) == 64 and
-                         all(c in '0123456789abcdef' for c in pwd.lower()))
-            if not is_hashed:
+            looks_like_sha256 = (
+                len(pwd) == 64
+                and all(c in '0123456789abcdef' for c in pwd.lower())
+            )
+            if not looks_like_sha256:
                 cursor.execute(
                     "UPDATE users SET password_hash=? WHERE user_id=?",
                     (hash_password(pwd), user['user_id'])
                 )
-    except Exception as e:
-        print(f"[DB] Migration: {e}")
+    except Exception as err:
+        print(f"[db] Password migration hiccup: {err}")
+        # Worst case — make sure there's at least a usable admin account
         try:
             cursor.execute("""
                 INSERT OR REPLACE INTO users
@@ -301,23 +317,27 @@ def _migrate_passwords(cursor):
             pass
 
 
+# -----------------------------------------------------------------------
+#  Backups & audit
+# -----------------------------------------------------------------------
+
 def backup_database():
-    """Create timestamped backup."""
-    if not os.path.exists(BACKUP_DIR):
-        os.makedirs(BACKUP_DIR)
+    """Copy the DB file to the backups folder with a timestamp."""
+    import os
+    os.makedirs(BACKUP_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(BACKUP_DIR, f"iarms_backup_{ts}.db")
-    shutil.copy2(DB_NAME, path)
-    return path
+    dest = os.path.join(BACKUP_DIR, f"iarms_backup_{ts}.db")
+    shutil.copy2(DB_NAME, dest)
+    return dest
 
 
 def log_audit(user_id, action, table_name=None, record_id=None,
               old_values=None, new_values=None, conn=None):
-    """Write audit log entry."""
-    close = False
+    """Write a row to the audit log. Pass an existing connection to avoid extra opens."""
+    should_close = False
     if conn is None:
         conn = get_connection()
-        close = True
+        should_close = True
     try:
         conn.execute("""
             INSERT INTO audit_log
@@ -326,10 +346,10 @@ def log_audit(user_id, action, table_name=None, record_id=None,
         """, (user_id, action, table_name, record_id,
               str(old_values) if old_values else None,
               str(new_values) if new_values else None))
-        if close:
+        if should_close:
             conn.commit()
-    except Exception as e:
-        print(f"[AUDIT] {e}")
+    except Exception as err:
+        print(f"[audit] Failed to log: {err}")
     finally:
-        if close:
+        if should_close:
             conn.close()

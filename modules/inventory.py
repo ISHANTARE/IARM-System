@@ -1,8 +1,7 @@
 """
-modules/inventory.py
---------------------
-Inventory Management Module.
-KEY CHANGE: Stock is deducted only on DISPATCH, not on invoice creation.
+Inventory management — products, stock movements, ABC classification, CSV I/O.
+
+Important: stock is only deducted when an invoice is dispatched, NOT when it's created.
 """
 
 from database import get_connection, log_audit
@@ -10,14 +9,14 @@ from datetime import datetime, timedelta
 import csv
 
 
-# ═══════════════════════════════════════════
-#  PRODUCT CRUD
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Product CRUD
+# -----------------------------------------------------------------------
 
 def add_product(product_code, product_name, category_id, unit,
                 purchase_price, selling_price, gst_rate, current_stock,
                 reorder_level, user_id=None):
-    """Add a new product."""
+    """Insert a new product. If there's initial stock, log a purchase transaction too."""
     conn = get_connection()
     try:
         cursor = conn.execute("""
@@ -29,6 +28,7 @@ def add_product(product_code, product_name, category_id, unit,
               selling_price, gst_rate, current_stock, reorder_level))
         pid = cursor.lastrowid
 
+        # If they're adding a product with stock already on hand, record it
         if current_stock > 0:
             _record_stock_txn(conn, pid, 'purchase', current_stock,
                               purchase_price, 'INIT', 'Initial stock', user_id)
@@ -37,37 +37,42 @@ def add_product(product_code, product_name, category_id, unit,
                   None, {'code': product_code}, conn)
         conn.commit()
         return pid
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        raise e
+        raise err
     finally:
         conn.close()
 
 
 def update_product(product_id, user_id=None, **kwargs):
-    """Update product fields."""
+    """Update whichever product fields are passed in via kwargs."""
     conn = get_connection()
     allowed = ['product_name', 'category_id', 'unit', 'purchase_price',
                'selling_price', 'gst_rate', 'reorder_level', 'is_active']
     clauses, vals = [], []
-    for k, v in kwargs.items():
-        if k in allowed:
-            clauses.append(f"{k}=?")
-            vals.append(v)
+    for key, val in kwargs.items():
+        if key in allowed:
+            clauses.append(f"{key}=?")
+            vals.append(val)
+
     if not clauses:
         conn.close()
         return False
+
     clauses.append("updated_at=?")
     vals.extend([datetime.now().isoformat(), product_id])
     conn.execute(
         f"UPDATE products SET {','.join(clauses)} WHERE product_id=?", vals)
+
+    log_audit(user_id, 'UPDATE_PRODUCT', 'products', product_id,
+              None, kwargs, conn)
     conn.commit()
     conn.close()
     return True
 
 
 def get_product(product_id):
-    """Get single product."""
+    """Fetch a single product by ID, including its category name."""
     conn = get_connection()
     row = conn.execute("""
         SELECT p.*, c.category_name FROM products p
@@ -79,9 +84,9 @@ def get_product(product_id):
 
 
 def get_all_products(active_only=True):
-    """Get all products with margin calculation."""
+    """Get all products with calculated profit margin."""
     conn = get_connection()
-    q = """
+    query = """
         SELECT p.*, c.category_name,
             (p.selling_price - p.purchase_price) as profit_margin,
             CASE WHEN p.purchase_price > 0
@@ -92,15 +97,16 @@ def get_all_products(active_only=True):
         LEFT JOIN categories c ON p.category_id=c.category_id
     """
     if active_only:
-        q += " WHERE p.is_active=1"
-    q += " ORDER BY p.product_name"
-    rows = conn.execute(q).fetchall()
+        query += " WHERE p.is_active=1"
+    query += " ORDER BY p.product_name"
+
+    rows = conn.execute(query).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def search_products(term):
-    """Search products by name/code/category."""
+    """Search products by name, code, or category."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT p.*, c.category_name FROM products p
@@ -114,7 +120,7 @@ def search_products(term):
 
 
 def delete_product(product_id, user_id=None):
-    """Soft-delete product."""
+    """Soft-delete — just sets is_active to 0 so history is preserved."""
     conn = get_connection()
     conn.execute("UPDATE products SET is_active=0, updated_at=? WHERE product_id=?",
                  (datetime.now().isoformat(), product_id))
@@ -123,13 +129,16 @@ def delete_product(product_id, user_id=None):
     conn.close()
 
 
-# ═══════════════════════════════════════════
-#  STOCK TRANSACTIONS
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  Stock movements
+# -----------------------------------------------------------------------
 
 def _record_stock_txn(conn, product_id, txn_type, quantity,
                       unit_price=0, ref='', remarks='', user_id=None):
-    """INTERNAL: Record stock movement on existing connection. No commit."""
+    """
+    Internal helper — writes a stock transaction row and adjusts the
+    product's current_stock accordingly. Does NOT commit (caller handles that).
+    """
     total = quantity * unit_price
     conn.execute("""
         INSERT INTO stock_transactions
@@ -138,6 +147,7 @@ def _record_stock_txn(conn, product_id, txn_type, quantity,
         VALUES (?,?,?,?,?,?,?,?)
     """, (product_id, txn_type, quantity, unit_price, total, ref, remarks, user_id))
 
+    # Inbound types add stock, outbound types subtract
     if txn_type in ('purchase', 'adjustment_in', 'return_in'):
         conn.execute("""
             UPDATE products SET current_stock=current_stock+?, updated_at=?
@@ -153,28 +163,31 @@ def _record_stock_txn(conn, product_id, txn_type, quantity,
 def record_stock_transaction(product_id, txn_type, quantity,
                               unit_price=0, ref='', remarks='',
                               user_id=None, conn=None):
-    """PUBLIC: Record stock movement."""
-    close = False
+    """Public wrapper — records a stock movement, optionally on an existing connection."""
+    should_close = False
     if conn is None:
         conn = get_connection()
-        close = True
+        should_close = True
     try:
         _record_stock_txn(conn, product_id, txn_type, quantity,
                           unit_price, ref, remarks, user_id)
-        if close:
+        if should_close:
             conn.commit()
         return True
-    except Exception as e:
-        if close:
+    except Exception as err:
+        if should_close:
             conn.rollback()
-        raise e
+        raise err
     finally:
-        if close:
+        if should_close:
             conn.close()
 
 
 def check_stock_availability(product_id, required_qty):
-    """Check if enough stock available. Returns (ok, current, shortage)."""
+    """
+    Quick stock check. Returns a tuple of (is_enough, current_stock, shortage).
+    Shortage is 0 if there's plenty.
+    """
     conn = get_connection()
     row = conn.execute(
         "SELECT current_stock FROM products WHERE product_id=?",
@@ -182,12 +195,12 @@ def check_stock_availability(product_id, required_qty):
     conn.close()
     if not row:
         return False, 0, required_qty
-    cur = row['current_stock']
-    return (cur >= required_qty, cur, max(0, required_qty - cur))
+    current = row['current_stock']
+    return (current >= required_qty, current, max(0, required_qty - current))
 
 
 def get_stock_history(product_id, limit=100):
-    """Get stock history for a product."""
+    """Get the recent stock transaction log for a particular product."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT st.*, u.full_name as created_by_name
@@ -200,49 +213,54 @@ def get_stock_history(product_id, limit=100):
     return [dict(r) for r in rows]
 
 
-# ═══════════════════════════════════════════
-#  ABC CLASSIFICATION
-# ═══════════════════════════════════════════
+# -----------------------------------------------------------------------
+#  ABC classification
+# -----------------------------------------------------------------------
 
 def calculate_abc_classification():
-    """ABC analysis based on annual consumption value."""
+    """
+    Run ABC analysis on all active products based on the last 12 months
+    of sales/dispatch value. A = top 80%, B = next 15%, C = bottom 5%.
+    """
     conn = get_connection()
-    ago = (datetime.now() - timedelta(days=365)).isoformat()
+    one_year_ago = (datetime.now() - timedelta(days=365)).isoformat()
+
     rows = conn.execute("""
-        SELECT p.product_id, COALESCE(SUM(st.total_amount),0) as av
+        SELECT p.product_id, COALESCE(SUM(st.total_amount),0) as annual_value
         FROM products p
         LEFT JOIN stock_transactions st ON p.product_id=st.product_id
             AND st.transaction_type IN ('sale','dispatch')
             AND st.transaction_date>=?
         WHERE p.is_active=1
-        GROUP BY p.product_id ORDER BY av DESC
-    """, (ago,)).fetchall()
+        GROUP BY p.product_id ORDER BY annual_value DESC
+    """, (one_year_ago,)).fetchall()
 
     products = [dict(r) for r in rows]
-    total = sum(p['av'] for p in products)
+    grand_total = sum(p['annual_value'] for p in products)
 
-    if total == 0:
+    if grand_total == 0:
+        # No sales data — everything stays as class C
         conn.execute("UPDATE products SET abc_class='C', annual_consumption_value=0")
         conn.commit()
         conn.close()
         return
 
-    cumulative = 0
+    running_total = 0
     for p in products:
-        cumulative += p['av']
-        pct = (cumulative / total) * 100
-        cls = 'A' if pct <= 80 else ('B' if pct <= 95 else 'C')
+        running_total += p['annual_value']
+        pct = (running_total / grand_total) * 100
+        abc = 'A' if pct <= 80 else ('B' if pct <= 95 else 'C')
         conn.execute("""
             UPDATE products SET abc_class=?, annual_consumption_value=?, updated_at=?
             WHERE product_id=?
-        """, (cls, p['av'], datetime.now().isoformat(), p['product_id']))
+        """, (abc, p['annual_value'], datetime.now().isoformat(), p['product_id']))
 
     conn.commit()
     conn.close()
 
 
 def get_abc_summary():
-    """ABC class summary."""
+    """Get a quick breakdown of how many products fall into each ABC class."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT abc_class, COUNT(*) as product_count,
@@ -256,7 +274,7 @@ def get_abc_summary():
 
 
 def get_low_stock_products():
-    """Products at or below reorder level."""
+    """Products sitting at or below their reorder level."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT p.*, c.category_name FROM products p
@@ -269,7 +287,7 @@ def get_low_stock_products():
 
 
 def get_all_categories():
-    """All categories."""
+    """All product categories, alphabetically."""
     conn = get_connection()
     rows = conn.execute("SELECT * FROM categories ORDER BY category_name").fetchall()
     conn.close()
@@ -277,7 +295,7 @@ def get_all_categories():
 
 
 def add_category(name, desc=""):
-    """Add category."""
+    """Create a new category."""
     conn = get_connection()
     cid = conn.execute(
         "INSERT INTO categories (category_name,description) VALUES (?,?)",
@@ -287,8 +305,12 @@ def add_category(name, desc=""):
     return cid
 
 
+# -----------------------------------------------------------------------
+#  CSV import/export
+# -----------------------------------------------------------------------
+
 def export_products_csv(filepath):
-    """Export products to CSV."""
+    """Dump all products to a CSV file."""
     products = get_all_products(active_only=False)
     if not products:
         return False
@@ -296,33 +318,42 @@ def export_products_csv(filepath):
               'purchase_price', 'selling_price', 'gst_rate',
               'current_stock', 'reorder_level', 'abc_class']
     with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(products)
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(products)
     return True
 
 
 def import_products_csv(filepath, user_id=None):
-    """Import products from CSV."""
+    """
+    Import products from a CSV file. Creates categories on-the-fly if needed.
+    Returns (success_count, error_count, error_details).
+    """
     categories = {c['category_name']: c['category_id']
                   for c in get_all_categories()}
     success, errors = 0, []
+
     with open(filepath, 'r', encoding='utf-8') as f:
-        for i, row in enumerate(csv.DictReader(f), start=2):
+        for row_num, row in enumerate(csv.DictReader(f), start=2):
             try:
-                cat = row.get('category_name', 'General')
-                cid = categories.get(cat)
+                cat_name = row.get('category_name', 'General')
+                cid = categories.get(cat_name)
                 if not cid:
-                    cid = add_category(cat)
-                    categories[cat] = cid
-                add_product(row['product_code'], row['product_name'], cid,
-                            row.get('unit', 'pcs'),
-                            float(row.get('purchase_price', 0)),
-                            float(row.get('selling_price', 0)),
-                            float(row.get('gst_rate', 18)),
-                            float(row.get('current_stock', 0)),
-                            float(row.get('reorder_level', 10)), user_id)
+                    cid = add_category(cat_name)
+                    categories[cat_name] = cid
+
+                add_product(
+                    row['product_code'], row['product_name'], cid,
+                    row.get('unit', 'pcs'),
+                    float(row.get('purchase_price', 0)),
+                    float(row.get('selling_price', 0)),
+                    float(row.get('gst_rate', 18)),
+                    float(row.get('current_stock', 0)),
+                    float(row.get('reorder_level', 10)),
+                    user_id
+                )
                 success += 1
-            except Exception as e:
-                errors.append(f"Row {i}: {e}")
+            except Exception as err:
+                errors.append(f"Row {row_num}: {err}")
+
     return success, len(errors), errors
