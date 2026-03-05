@@ -1,0 +1,256 @@
+"""
+modules/reporting.py
+--------------------
+Reporting module — unchanged from previous except minor status filter fixes.
+"""
+
+from database import get_connection
+from datetime import datetime, timedelta
+import csv
+import os
+
+
+def get_aged_receivables():
+    conn = get_connection()
+    today = datetime.now()
+    invoices = conn.execute("""
+        SELECT i.*, c.customer_name FROM invoices i
+        JOIN customers c ON i.customer_id=c.customer_id
+        WHERE i.balance_due>0 AND i.status NOT IN ('cancelled','paid')
+        ORDER BY i.invoice_date
+    """).fetchall()
+    conn.close()
+
+    aged = {'current': [], '31_60': [], '61_90': [], 'over_90': [],
+            'totals': {'current': 0, '31_60': 0, '61_90': 0,
+                       'over_90': 0, 'grand_total': 0}}
+
+    for inv in invoices:
+        d = dict(inv)
+        age = (today - datetime.strptime(inv['invoice_date'], '%Y-%m-%d')).days
+        d['age_days'] = age
+        bucket = ('current' if age <= 30 else '31_60' if age <= 60
+                  else '61_90' if age <= 90 else 'over_90')
+        aged[bucket].append(d)
+        aged['totals'][bucket] += inv['balance_due']
+
+    aged['totals']['grand_total'] = sum(
+        aged['totals'][k] for k in ['current', '31_60', '61_90', 'over_90'])
+    return aged
+
+
+def calculate_dso(period_days=30):
+    conn = get_connection()
+    end = datetime.now()
+    start = end - timedelta(days=period_days)
+
+    ar = conn.execute("""
+        SELECT COALESCE(SUM(balance_due),0) as v FROM invoices
+        WHERE status NOT IN ('cancelled','paid') AND balance_due>0
+    """).fetchone()['v']
+
+    sales = conn.execute("""
+        SELECT COALESCE(SUM(total_amount),0) as v FROM invoices
+        WHERE invoice_date BETWEEN ? AND ? AND status!='cancelled'
+    """, (start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))).fetchone()['v']
+
+    conn.close()
+    dso = (ar / sales * period_days) if sales > 0 else 0
+    return {'dso': round(dso, 1), 'total_receivable': round(ar, 2),
+            'total_sales': round(sales, 2), 'period_days': period_days}
+
+
+def get_dso_trend(months=6):
+    trend = []
+    today = datetime.now()
+    for i in range(months - 1, -1, -1):
+        me = today - timedelta(days=30 * i)
+        ms = me - timedelta(days=30)
+        conn = get_connection()
+        ar = conn.execute("""
+            SELECT COALESCE(SUM(balance_due),0) as v FROM invoices
+            WHERE invoice_date<=? AND status NOT IN ('cancelled','paid')
+        """, (me.strftime('%Y-%m-%d'),)).fetchone()['v']
+        sales = conn.execute("""
+            SELECT COALESCE(SUM(total_amount),0) as v FROM invoices
+            WHERE invoice_date BETWEEN ? AND ? AND status!='cancelled'
+        """, (ms.strftime('%Y-%m-%d'), me.strftime('%Y-%m-%d'))).fetchone()['v']
+        conn.close()
+        dso = (ar / sales * 30) if sales > 0 else 0
+        trend.append({'month': me.strftime('%b %Y'), 'dso': round(dso, 1),
+                      'receivable': round(ar, 2), 'sales': round(sales, 2)})
+    return trend
+
+
+def get_top_customers_by_outstanding(limit=10):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT c.customer_id, c.customer_name, c.phone,
+            c.customer_type, c.credit_limit,
+            COUNT(i.invoice_id) as invoice_count,
+            SUM(i.total_amount) as total_billed,
+            SUM(i.balance_due) as total_outstanding,
+            AVG(i.payment_delay_days) as avg_delay
+        FROM customers c
+        JOIN invoices i ON c.customer_id=i.customer_id
+        WHERE i.status NOT IN ('cancelled') AND i.balance_due>0
+        GROUP BY c.customer_id ORDER BY total_outstanding DESC LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_customer_payment_profile(customer_id):
+    conn = get_connection()
+    stats = conn.execute("""
+        SELECT COUNT(*) as total_invoices,
+            COALESCE(SUM(total_amount),0) as total_billed,
+            COALESCE(SUM(amount_paid),0) as total_paid,
+            COALESCE(SUM(balance_due),0) as total_outstanding,
+            COALESCE(AVG(payment_delay_days),0) as avg_delay,
+            SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) as paid_count,
+            SUM(CASE WHEN status='overdue' THEN 1 ELSE 0 END) as overdue_count,
+            SUM(CASE WHEN payment_delay_days>0 THEN 1 ELSE 0 END) as late_count
+        FROM invoices WHERE customer_id=? AND status!='cancelled'
+    """, (customer_id,)).fetchone()
+
+    recent = conn.execute("""
+        SELECT invoice_number, invoice_date, due_date, total_amount,
+            amount_paid, balance_due, status, payment_delay_days,
+            is_dispatched, is_paid
+        FROM invoices WHERE customer_id=? AND status!='cancelled'
+        ORDER BY invoice_date DESC LIMIT 20
+    """, (customer_id,)).fetchall()
+    conn.close()
+
+    profile = dict(stats) if stats else {}
+    profile['recent_invoices'] = [dict(r) for r in recent]
+    total = profile.get('total_invoices', 0)
+    if total > 0:
+        late_pct = (profile.get('late_count', 0) / total) * 100
+        profile['rating'] = ('Excellent' if late_pct <= 10 else
+                             'Good' if late_pct <= 25 else
+                             'Average' if late_pct <= 50 else 'Poor')
+    else:
+        profile['rating'] = 'New Customer'
+    return profile
+
+
+def get_dashboard_kpis():
+    conn = get_connection()
+    today = datetime.now().strftime('%Y-%m-%d')
+    ms = datetime.now().replace(day=1).strftime('%Y-%m-%d')
+
+    inv = conn.execute("""
+        SELECT COUNT(*) as total_products,
+            SUM(CASE WHEN current_stock<=reorder_level THEN 1 ELSE 0 END) as low_stock_count,
+            SUM(CASE WHEN current_stock<=0 THEN 1 ELSE 0 END) as out_of_stock_count,
+            COALESCE(SUM(current_stock*selling_price),0) as total_inventory_value
+        FROM products WHERE is_active=1
+    """).fetchone()
+
+    sales = conn.execute("""
+        SELECT COUNT(*) as total_invoices,
+            COALESCE(SUM(total_amount),0) as total_revenue,
+            COALESCE(SUM(balance_due),0) as total_outstanding,
+            COALESCE(SUM(amount_paid),0) as total_collected,
+            SUM(CASE WHEN status='overdue' THEN 1 ELSE 0 END) as overdue_count,
+            SUM(CASE WHEN is_dispatched=1 AND is_paid=0 AND status!='cancelled'
+                THEN 1 ELSE 0 END) as dispatched_unpaid,
+            SUM(CASE WHEN is_dispatched=0 AND status NOT IN ('cancelled','paid')
+                THEN 1 ELSE 0 END) as pending_dispatch
+        FROM invoices WHERE status!='cancelled'
+    """).fetchone()
+
+    monthly = conn.execute("""
+        SELECT COUNT(*) as month_invoices,
+            COALESCE(SUM(total_amount),0) as month_revenue,
+            COALESCE(SUM(amount_paid),0) as month_collected
+        FROM invoices WHERE invoice_date>=? AND status!='cancelled'
+    """, (ms,)).fetchone()
+
+    daily = conn.execute("""
+        SELECT COUNT(*) as today_invoices,
+            COALESCE(SUM(total_amount),0) as today_revenue
+        FROM invoices WHERE invoice_date=? AND status!='cancelled'
+    """, (today,)).fetchone()
+
+    cc = conn.execute(
+        "SELECT COUNT(*) as cnt FROM customers WHERE is_active=1"
+    ).fetchone()
+    conn.close()
+
+    dso = calculate_dso(30)
+
+    return {
+        'inventory': dict(inv) if inv else {},
+        'sales': dict(sales) if sales else {},
+        'monthly': dict(monthly) if monthly else {},
+        'daily': dict(daily) if daily else {},
+        'customer_count': cc['cnt'] if cc else 0,
+        'dso': dso['dso']
+    }
+
+
+def get_monthly_sales_trend(months=12):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT strftime('%Y-%m', invoice_date) as month,
+            COUNT(*) as invoice_count,
+            COALESCE(SUM(total_amount),0) as revenue,
+            COALESCE(SUM(amount_paid),0) as collected,
+            COALESCE(SUM(balance_due),0) as outstanding
+        FROM invoices WHERE status!='cancelled'
+            AND invoice_date>=date('now', ? || ' months')
+        GROUP BY strftime('%Y-%m', invoice_date) ORDER BY month
+    """, (f"-{months}",)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_profit_report(date_from=None, date_to=None):
+    conn = get_connection()
+    q = """
+        SELECT p.product_code, p.product_name,
+            SUM(ii.quantity) as total_qty_sold,
+            SUM(ii.quantity*ii.unit_price) as total_revenue,
+            SUM(ii.quantity*p.purchase_price) as total_cost,
+            SUM(ii.quantity*(ii.unit_price-p.purchase_price)) as total_profit
+        FROM invoice_items ii
+        JOIN invoices i ON ii.invoice_id=i.invoice_id
+        JOIN products p ON ii.product_id=p.product_id
+        WHERE i.status NOT IN ('cancelled')
+    """
+    params = []
+    if date_from:
+        q += " AND i.invoice_date>=?"
+        params.append(date_from)
+    if date_to:
+        q += " AND i.invoice_date<=?"
+        params.append(date_to)
+    q += " GROUP BY p.product_id ORDER BY total_profit DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def export_aged_receivables_csv():
+    aged = get_aged_receivables()
+    path = os.path.join("exports",
+                        f"aged_receivables_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    items = []
+    for bname, bkey in [('0-30', 'current'), ('31-60', '31_60'),
+                        ('61-90', '61_90'), ('90+', 'over_90')]:
+        for i in aged[bkey]:
+            items.append({
+                'Bucket': bname, 'Invoice': i['invoice_number'],
+                'Customer': i['customer_name'], 'Date': i['invoice_date'],
+                'Total': i['total_amount'], 'Balance': i['balance_due'],
+                'Age': i['age_days']
+            })
+    if items:
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=items[0].keys())
+            w.writeheader()
+            w.writerows(items)
+    return path

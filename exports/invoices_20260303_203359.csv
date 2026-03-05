@@ -1,0 +1,2 @@
+invoice_number,customer_name,invoice_date,due_date,total_amount,amount_paid,balance_due,status,payment_delay_days
+INV-2026-00001,sujatro,2026-03-03,2026-03-18,7080000.0,0.0,7080000.0,pending,0
